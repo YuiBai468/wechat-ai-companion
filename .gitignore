@@ -1,0 +1,29 @@
+# ── 绝对不能提交的东西 ──────────────────────────────────────────────
+# 聊天记录（里面是真实对话）
+data/
+contexts.json
+schedule-state.json
+*.bak
+
+# 密钥
+.credentials.yaml
+.env
+*.key
+
+# 日志
+logs/
+wechatauto_logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

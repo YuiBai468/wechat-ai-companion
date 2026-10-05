@@ -40,6 +40,34 @@
 
 ---
 
+## 它还能"看见"你 —— 手环联动
+
+戴上小米手环，她能看见你的**心率、压力、血氧、睡眠、运动**，并在合适的时候主动来问你。
+
+```
+心率 150-170    「你心率上来了，在干嘛呀」
+心率 170-190    「你怎么了…本小姐随便看了一眼，可没在意你」
+心率 190+       「你没事吧，说句话」        ← 真急了，不嘴硬
+血氧 < 90       「你现在就起来，去看看医生。我不开玩笑。」
+压力 > 40       「是不是很累，我陪你一会儿」
+压力 < 20       「你今天心情不错吧」         ← 挑时机找你聊天
+睡眠有问题       按具体问题说（深睡少 / REM 多 / 醒得多 / 睡太晚）
+凌晨还没睡       「几点了还不睡」
+```
+
+**核心设计：**
+
+```
+· 傲娇底色自动追加到每条剧本 —— 不能光傲不娇
+· 五重防打扰（阈值/持续性/冷却/每日上限/静默时段）
+· 互斥规则（运动时心率高正常、睡觉时压力低正常、他刚说完话不插嘴）
+· 所有阈值都在电脑端 —— 改剧本不用重编手机 App
+```
+
+**完整的搭建步骤见 → [手环接入指南](手环接入指南.md)**
+
+---
+
 ## 快速开始
 
 ### 1. 装依赖
@@ -274,6 +302,119 @@ Do not play her cool, terse, or guarded. She is the opposite: she **overflows**.
 
 ---
 
+### 手环 / 硬件（这部分坑最深）
+
+**① Gadgetbridge 上游删掉了联网权限 —— 最隐蔽的一个**
+
+```xml
+<uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+```
+
+它主打"数据不出手机"，所以**主动把联网权限删掉**。
+
+**症状**：推送设置全对、权限全给、手环连着、电脑端口开着 —— **就是没有任何数据，而且两边日志都什么都没有**。
+
+因为 `HttpURLConnection` 抛异常时被"吞掉异常防止崩溃"的代码静静吃掉了。
+
+**排查方法**：别猜，直接查编好的 APK：
+
+```bash
+aapt2 dump permissions app-debug.apk | grep INTERNET
+```
+
+**② 小米/MIUI 拦 adb 安装**
+
+报 `INSTALL_FAILED_USER_RESTRICTED: Install canceled by user`，
+手机通知栏显示「应用安装拦截」。
+
+**解法**：开发者选项 → **「USB安装」**打开（注意不是"USB调试"，也不是"USB调试（安全设置）"，是单独的一项）。
+
+**③ 批量同步只推最后一条样本 = 把一整天扔掉**
+
+原来的写法：
+
+```java
+// ❌ 只发最后一条
+HealthPush.pushSample(list.get(list.size() - 1), false);
+```
+
+一次同步几百上千条样本，结果只发了一条。
+
+**改成整批发**（一天约 70KB，一次同步一发，完全可接受）。
+
+**④ 逐条推 + 按"值变了就推" = 每秒一次 POST**
+
+```java
+// ❌ 值变了就推，无视间隔
+if (!changed && !stale) return false;
+```
+
+心率每秒都在变 → 一天 86000 次请求。
+
+**正确顺序是先卡频率**：
+
+```java
+// ✅ 间隔不到就不推，无论值变没变
+if (now - prev[1] < minInterval * 1000L) return false;
+```
+
+**⑤ 重放历史数据时，别用墙上时钟算"持续多久"**
+
+批量重放是**瞬间跑完**的。如果用 `System.currentTimeMillis()` 算"心率高了多久"，永远得到 0 秒 —— 一段真实 5 分钟的心率飙升会被判定为"没持续"。
+
+**必须用样本自己的时间戳。**
+
+**⑥ 睡眠数据不是实时的**
+
+手环**只在实时流里推心率和步数**。压力、血氧、睡眠都是"存在手环上、等 App 来取"。
+
+而 Gadgetbridge 默认只在**解锁手机时**才去取一次。要实时就得自己在设备服务里加定时抓取：
+
+```java
+onFetchRecordedData(RecordedDataTypes.TYPE_ACTIVITY
+        | RecordedDataTypes.TYPE_STRESS
+        | RecordedDataTypes.TYPE_SPO2
+        | RecordedDataTypes.TYPE_SLEEP);
+```
+
+**⑦ 睡眠摘要要用"他真正醒来的时刻"判断时机**
+
+睡眠数据什么时候到，取决于什么时候同步 —— 可能是几小时后。
+
+如果不加判断，会出现**下午三点她说"你昨晚睡得不好"**。用摘要里的 `wake` 时间戳卡一个窗口（比如 2 小时）。
+
+**⑧ Android 9+ 默认禁明文 HTTP**
+
+发 `http://` 要在 manifest 里配：
+
+```xml
+<application android:networkSecurityConfig="@xml/network_security_config" ...>
+<!-- network_security_config.xml -->
+<base-config cleartextTrafficPermitted="true">
+```
+
+（Gadgetbridge 上游已经配好了，但你自己 fork 别的 App 要注意。）
+
+**⑨ Tailscale 的登录回调进不了手机 App**
+
+在电脑上打开手机的授权链接，服务端会显示设备已加入，**但手机 App 仍然是"未登录"状态** —— 因为 OAuth 回调是发给手机浏览器的，进不了 App。
+
+**必须在手机的浏览器里完成整个登录流程。**
+
+（而且 GitHub 在手机流量下经常打不开 —— 得先开梯子，登录完再换成 Tailscale。两个 VPN 抢一个槽位。）
+
+**⑩ 截图预览分辨率和实际分辨率不一样**
+
+用 adb 点击屏幕时，`read_image` 看到的预览图可能被缩放过。**必须按实际分辨率换算坐标**，否则点不中。
+
+```powershell
+# 预览 838x1862 → 实际 1080x2400
+$scale = 1080 / 838   # 1.289
+$realX = [int]($previewX * $scale)
+```
+
+---
+
 ## 成本
 
 ```
@@ -341,6 +482,7 @@ $si = ([wmiclass]'Win32_ProcessStartup').CreateInstance(); $si.ShowWindow = 0
 wechat-ai-companion/
 ├── wechat-bot.py            # 主程序（单文件，~1800 行）
 ├── config.json              # 配置（存盘即生效）
+├── 手环接入指南.md      # 小米手环 → Gadgetbridge → 电脑，完整搭建步骤
 ├── requirements.txt
 ├── boot.cmd                 # 后台常驻
 ├── personas/

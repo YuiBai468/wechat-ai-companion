@@ -1,183 +1,206 @@
 {
-    "baseUrl":  "https://api.deepseek.com",
-    "model":  "deepseek-flash",
-    "credentialsFile":  ".credentials.yaml",
-    "credentialsRef":  "DEEPSEEK_API_KEY",
-    "apiKey":  "",
-    "personaFile":  "personas/groupmate.md",
-    "chats":  [
-                  {
-                      "name":  "老婆",
-                      "mode":  "always",
-                      "personaFile":  "personas/furina.md",
-                      "proactive":  true,
-                      "kind":  "private"
-                  },
-                  {
-                      "name":  "群聊A",
-                      "mode":  "wake",
-                      "kind":  "group",
-                      "personaFile":  "personas/groupmate.md"
-                  },
-                  {
-                      "name":  "群聊B",
-                      "mode":  "wake",
-                      "kind":  "group",
-                      "personaFile":  "personas/groupmate.md"
-                  },
-                  {
-                      "name":  "群聊C",
-                      "mode":  "wake",
-                      "kind":  "group",
-                      "personaFile":  "personas/groupmate.md"
-                  }
-              ],
-    "nicknames":  [
-                      "机器人",
-                      "小助手"
-                  ],
-    "wakeProbability":  0.03,
-    "followupSeconds":  0,
-    "historyLimit":  12,
-    "contextFile":  "data/contexts.json",
-    "sendDelayMin":  1,
-    "sendDelayMax":  5,
-    "dailySendLimit":  600,
-    "readDelay":  0.3,
-    "selfSenderId":  2,
-    "logFile":  "logs/wechat-bot.log",
-    "thinking":  "low",
-    "temperature":  1.15,
-    "maxTokens":  400,
-    "maxBubbles":  5,
-    "bubbleGapMin":  0.5,
-    "bubbleGapMax":  2,
-    "proactive":  {
-                      "enabled":  true,
-                      "checkSeconds":  30,
-                      "silenceMin":  [
-                                         50,
-                                         160
-                                     ],
-                      "nudgeMin":  [
-                                       6,
-                                       20
-                                   ],
-                      "angryMin":  [
-                                       45,
-                                       110
-                                   ],
-                      "lastMin":  [
-                                      200,
-                                      400
-                                  ],
-                      "dailyLimit":  5,
-                      "minGapMin":  40,
-                      "chance":  0.65,
-                      "quietHours":  [
-                                         1,
-                                         7
-                                     ]
-                  },
-    "debounceSeconds":  2,
-    "debounceMaxSeconds":  6,
-    "sendTimeoutSeconds":  75,
-    "sendHardTimeoutSeconds":  150,
-    "sendPauseSeconds":  300,
-    "rhythmProfile":  "fast",
-    "rhythmBurst":  0,
-    "rhythmWindow":  0,
-    "humanize":  {
-                     "enabled":  true,
-                     "sleepHours":  [
-                                        1,
-                                        7
-                                    ],
-                     "sleepDelayMin":  40,
-                     "sleepDelayMax":  150,
-                     "sleepSilentChance":  0.7,
-                     "ignoreChance":  0.008,
-                     "slowReplyChance":  0.1,
-                     "slowReplyMin":  3,
-                     "slowReplyMax":  10,
-                     "sleepWakeWords":  [
-                                            "睡不着",
-                                            "失眠",
-                                            "睡不着觉",
-                                            "难受",
-                                            "好难受",
-                                            "想你了",
-                                            "好想你",
-                                            "出事了",
-                                            "怎么办",
-                                            "哭了",
-                                            "救",
-                                            "急",
-                                            "怕"
-                                        ],
-                     "sleepWakeDelayMin":  6,
-                     "sleepWakeDelayMax":  25,
-                     "sleepEscalateFactor":  0.55,
-                     "sleepEscalateWindowMin":  12
-                 },
-    "schedule":  {
-                     "enabled":  true,
-                     "wake":  {
-                                  "enabled":  true,
-                                  "at":  "07:00",
-                                  "jitterMin":  40
-                              },
-                     "meals":  [
-                                   {
-                                       "enabled":  true,
-                                       "name":  "早饭",
-                                       "at":  "09:00",
-                                       "jitterMin":  50
-                                   },
-                                   {
-                                       "enabled":  true,
-                                       "name":  "午饭",
-                                       "at":  "12:40",
-                                       "jitterMin":  60
-                                   },
-                                   {
-                                       "enabled":  true,
-                                       "name":  "晚饭",
-                                       "at":  "18:40",
-                                       "jitterMin":  60
-                                   }
-                               ],
-                     "sleep":  {
-                                   "enabled":  true,
-                                   "at":  "01:00",
-                                   "jitterMin":  45
-                               },
-                     "insomnia":  {
-                                      "enabled":  true,
-                                      "from":  "23:30",
-                                      "to":  "00:45",
-                                      "minDays":  1,
-                                      "maxDays":  2,
-                                      "aheadMin":  2,
-                                      "aheadMax":  6
-                                  },
-                     "catchUpMinutes":  60,
-                     "randomChats":  {
-                                         "enabled":  true,
-                                         "from":  "09:30",
-                                         "to":  "23:30",
-                                         "minPerDay":  1,
-                                         "maxPerDay":  3,
-                                         "avoidMinutes":  45
-                                     }
-                 },
-    "groupCooldownSeconds":  45,
-    "quietHours":  [
-
-                   ],
-    "groupMaxBubbles":  2,
-    "imageLookbackSeconds":  180,
-    "minBubbleChars":  6,
-    "maxBubbleChars":  26,
-    "absoluteMaxBubbles":  6
+  "baseUrl": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "credentialsFile": ".credentials.yaml",
+  "credentialsRef": "DEEPSEEK_API_KEY",
+  "apiKey": "",
+  "personaFile": "personas/groupmate.md",
+  "chats": [
+    {
+      "name": "老婆",
+      "mode": "always",
+      "personaFile": "personas/furina.md",
+      "proactive": true,
+      "kind": "private"
+    },
+    {
+      "name": "群聊A",
+      "mode": "wake",
+      "kind": "group",
+      "personaFile": "personas/groupmate.md"
+    },
+    {
+      "name": "群聊B",
+      "mode": "wake",
+      "kind": "group",
+      "personaFile": "personas/groupmate.md"
+    },
+    {
+      "name": "群聊C",
+      "mode": "wake",
+      "kind": "group",
+      "personaFile": "personas/groupmate.md"
+    }
+  ],
+  "nicknames": [
+    "机器人",
+    "小助手"
+  ],
+  "wakeProbability": 0.03,
+  "followupSeconds": 0,
+  "historyLimit": 12,
+  "contextFile": "data/contexts.json",
+  "sendDelayMin": 1,
+  "sendDelayMax": 5,
+  "dailySendLimit": 600,
+  "readDelay": 0.3,
+  "selfSenderId": 2,
+  "logFile": "logs/wechat-bot.log",
+  "thinking": "low",
+  "temperature": 1.15,
+  "maxTokens": 400,
+  "maxBubbles": 5,
+  "bubbleGapMin": 0.5,
+  "bubbleGapMax": 2,
+  "proactive": {
+    "enabled": true,
+    "checkSeconds": 30,
+    "silenceMin": [
+      50,
+      160
+    ],
+    "nudgeMin": [
+      6,
+      20
+    ],
+    "angryMin": [
+      45,
+      110
+    ],
+    "lastMin": [
+      200,
+      400
+    ],
+    "dailyLimit": 5,
+    "minGapMin": 40,
+    "chance": 0.65,
+    "quietHours": [
+      1,
+      7
+    ]
+  },
+  "debounceSeconds": 2,
+  "debounceMaxSeconds": 6,
+  "sendTimeoutSeconds": 75,
+  "sendHardTimeoutSeconds": 150,
+  "sendPauseSeconds": 300,
+  "rhythmProfile": "fast",
+  "rhythmBurst": 0,
+  "rhythmWindow": 0,
+  "humanize": {
+    "enabled": true,
+    "sleepHours": [
+      1,
+      7
+    ],
+    "sleepDelayMin": 40,
+    "sleepDelayMax": 150,
+    "sleepSilentChance": 0.7,
+    "ignoreChance": 0.008,
+    "slowReplyChance": 0.1,
+    "slowReplyMin": 3,
+    "slowReplyMax": 10,
+    "sleepWakeWords": [
+      "睡不着",
+      "失眠",
+      "睡不着觉",
+      "难受",
+      "好难受",
+      "想你了",
+      "好想你",
+      "出事了",
+      "怎么办",
+      "哭了",
+      "救",
+      "急",
+      "怕"
+    ],
+    "sleepWakeDelayMin": 6,
+    "sleepWakeDelayMax": 25,
+    "sleepEscalateFactor": 0.55,
+    "sleepEscalateWindowMin": 12
+  },
+  "schedule": {
+    "enabled": true,
+    "wake": {
+      "enabled": true,
+      "at": "07:00",
+      "jitterMin": 40
+    },
+    "meals": [
+      {
+        "enabled": true,
+        "name": "早饭",
+        "at": "09:00",
+        "jitterMin": 50
+      },
+      {
+        "enabled": true,
+        "name": "午饭",
+        "at": "12:40",
+        "jitterMin": 60
+      },
+      {
+        "enabled": true,
+        "name": "晚饭",
+        "at": "18:40",
+        "jitterMin": 60
+      }
+    ],
+    "sleep": {
+      "enabled": true,
+      "at": "01:00",
+      "jitterMin": 45
+    },
+    "insomnia": {
+      "enabled": true,
+      "from": "23:30",
+      "to": "00:45",
+      "minDays": 1,
+      "maxDays": 2,
+      "aheadMin": 2,
+      "aheadMax": 6
+    },
+    "catchUpMinutes": 60,
+    "randomChats": {
+      "enabled": true,
+      "from": "09:30",
+      "to": "23:30",
+      "minPerDay": 1,
+      "maxPerDay": 3,
+      "avoidMinutes": 45
+    }
+  },
+  "groupCooldownSeconds": 45,
+  "quietHours": [],
+  "groupMaxBubbles": 2,
+  "imageLookbackSeconds": 180,
+  "minBubbleChars": 6,
+  "maxBubbleChars": 26,
+  "absoluteMaxBubbles": 6,
+  "health": {
+    "enabled": true,
+    "port": 8765,
+    "token": "",
+    "hrHigh": 150,
+    "hrHard": 170,
+    "hrExtreme": 190,
+    "hrSustainSeconds": 60,
+    "spo2Low": 90,
+    "stressLow": 20,
+    "stressHigh": 40,
+    "sleepShortH": 5,
+    "sleepLongH": 10,
+    "wakeLateHour": 12,
+    "nightStartH": 1,
+    "nightEndH": 5,
+    "sleepFreshMin": 120,
+    "workoutGraceMin": 10,
+    "workoutStaleHours": 3,
+    "hrExtremeInWorkout": 190,
+    "cooldownMin": 25,
+    "dailyLimit": 10,
+    "quietHours": [],
+    "restHrJump": 8
+  }
 }

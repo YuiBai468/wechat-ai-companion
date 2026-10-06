@@ -146,13 +146,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "enabled": True,
         # 睡觉时间（本地小时，跨零点写 [22, 7]）。真人这时候基本不活跃。
         "sleepHours": [2, 8],
-        # 睡觉时收到消息：大部分拖很久才回（半梦半醒），或者干脆不回（等早上）
+        # 睡觉时收到消息：大部分拖一会儿才回（半梦半醒），偶尔这条真没看见。
         "sleepDelayMin": 40,
         "sleepDelayMax": 150,
-        # 睡觉时不回的概率。**谁睡觉看手机啊** —— 70% 就是不回。
-        # 但不会变成"永远不回"：他连着发会把她吵醒（见 sleepEscalateFactor）。
-        "sleepSilentChance": 0.70,
-        # 每多收一条，不回概率乘这个系数 → 70% / 38% / 21% / 12% / 6%
+        # 睡觉时"这条没看见"的概率。
+        # ⚠️ 别调高 —— 调高了就变成**她刚说完「我睡不着，想你了」，他回一句，人没了**。
+        # 踩过：0.25 会让人直接问「怎么不理我啥意思」。
+        # 现在靠三样东西兜底：① 下面那位 awakeIfSpokeWithinMin（她刚说过话 = 她醒着）
+        # ② sleepEscalateFactor（他连着发会把她吵醒）③ 拖回复有硬上限 30 秒。
+        "sleepSilentChance": 0.25,
+        # 每多收一条，没看见的概率乘这个系数 → 25% / 14% / 8% / 4% / 2%
         "sleepEscalateFactor": 0.55,
         # 多久以内的消息算"连着发"（分钟）
         "sleepEscalateWindowMin": 12,
@@ -163,8 +166,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 被叫醒之后也要迷糊一会儿（秒）
         "sleepWakeDelayMin": 6,
         "sleepWakeDelayMax": 25,
-        # 平时偶尔"已读不回" —— 真人不总是回。但调高了她就冷，保持在 1% 以下。
-        "ignoreChance": 0.008,
+        # ⚠️ 这里原来有个 ignoreChance（平时偶尔"已读不回"），**已经删掉了**。
+        # 理由：他说话就是说话，不存在"她正好没看见"这回事 ——
+        # 一晚上被晾两次他就来问「怎么不理我啥意思」了。
+        # 想让她冷，该调的是人设和冷却，不是随机丢消息。
         # 偶尔"想了半天才回"，而不是永远落在 1~5 秒那个固定区间
         "slowReplyChance": 0.10,
         "slowReplyMin": 3,
@@ -1260,16 +1265,16 @@ class Bot:
                                    "因为你太清楚睡不着是什么滋味了。**不要写「我刚醒」这种解释**，"
                                    "直接接着他的话往下说，短，两句以内。")
                 else:
-                    # 他连着发会把她吵醒：第一条大概率不理，越连发越可能醒。
-                    # 70% → 38% → 21% → 12% → 6%
+                    # 他连着发会把她吵醒：第一条有可能没看见，越连发越可能醒。
+                    # 25% → 14% → 8% → 4% → 2%
                     win = float(hz.get("sleepEscalateWindowMin") or 12) * 60
                     nowt = time.time()
                     n = sum(1 for t in (self.recent_user_msgs.get(chat) or []) if nowt - t <= win)
-                    base = float(hz.get("sleepSilentChance") or 0.70)
+                    base = float(hz.get("sleepSilentChance") or 0.25)
                     factor = float(hz.get("sleepEscalateFactor") or 0.55)
                     silent = base * (factor ** max(0, n - 1))
                     if random.random() < silent:
-                        log(f"    （作息低谷：这条不回，{silent*100:.0f}%"
+                        log(f"    （作息低谷：这条没看见，{silent*100:.0f}%"
                             + (f"，他已连发 {n} 条" if n > 1 else "") + "）")
                         return
                     # 上限硬截 —— 晾他 94 秒不是「有人味」，是失联。
@@ -1281,9 +1286,6 @@ class Bot:
                     delay_override = random.uniform(dmin, dmax)
                     log(f"    （作息低谷：被吵醒了，拖 {delay_override:.0f}s 再回"
                         + (f"，连发 {n} 条" if n > 1 else "") + "）")
-            elif random.random() < float(hz.get("ignoreChance") or 0.02):
-                log("    （这次不回 —— 真人不总是回）")
-                return
             elif random.random() < float(hz.get("slowReplyChance") or 0.15):
                 # ⚠️ **被 @ / 被叫到的时候不能拖** —— 群里你点名找她，
                 # 她晾你 68 秒；而且这个 sleep 会阻塞唯一的 worker，

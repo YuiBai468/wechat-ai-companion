@@ -49,7 +49,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # ⚠️ 开启思考后 temperature 不生效（官方明确说明），回复的随机性会略降。
     "thinking": "low",
     "temperature": 1.15,
-    "maxTokens": 400,
+    # ⚠️ 别调到 400 —— 开思考后 **思考 token 也算进 max_tokens**。
+    #    实测 400 时思考吃满、content 吐空，一晚上静默漏掉 11 条回复。
+    #    900 是实测稳的值。
+    "maxTokens": 900,
     # 从 DSH 的凭据库里取 key，避免明文复制到本文件
     "credentialsFile": r"C:\Users\YuBai\.dsh\.credentials.yaml",
     "credentialsRef": "DEEPSEEK_API_KEY",
@@ -70,9 +73,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     # mode: "always" 说话就回 ｜ "wake" 被叫到或抽中概率才回 ｜ "off" 完全不理
     "chats": [
         {"name": "主人", "mode": "always", "kind": "private"},
-        {"name": "群聊A", "mode": "wake", "kind": "group"},
-        {"name": "群聊B", "mode": "wake", "kind": "group"},
-        {"name": "群聊C", "mode": "wake", "kind": "group"},
+        {"name": "米奇妙妙屋", "mode": "wake", "kind": "group"},
+        {"name": "相侵相碍六家人", "mode": "wake", "kind": "group"},
+        {"name": "麻豆传媒", "mode": "wake", "kind": "group"},
     ],
     # 命中即唤醒（正文包含任一即算被叫）
     "nicknames": ["大肥鱼", "肥鱼", "谁最帅", "谁帅", "最帅的人"],
@@ -256,7 +259,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "quietHours": [],         # 空 = 不静默（睡眠相关本来就要夜里说）
     },
 
-    "logFile": ros.path.join(HERE, "wechat-bot.log"),
+    "logFile": r"D:\llm\logs\wechat-bot.log",
 }
 
 
@@ -287,6 +290,186 @@ def reload_config() -> None:
         log(f"配置热重载失败（忽略）: {e}")
 
 
+# ══════════════════════════════════ 控制台遥测 ══════════════════════════════════
+# 一块"看板"用的实时数据。设计原则：
+#   · 只加不减 —— 任何 emit 失败都不能影响主循环（她该说说该回回）
+#   · 队列满就丢最旧的 —— 控制台再卡也不会拖慢她
+#   · 内存有上限 —— 环形缓冲，跑一个月也不涨
+class Telemetry:
+    """环形缓冲 + SSE 订阅。给 /console 看板用。"""
+
+    MAX_EVENTS = 800        # 内存里保留多少条事件
+    MAX_SUBS = 8            # 最多几个浏览器在连
+    SUB_QUEUE = 512         # 每个订阅者的待发队列
+    SERIES = 240            # 健康曲线保留多少个点
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._events: List[Dict[str, Any]] = []
+        self._subs: List[Any] = []
+        self._seq = 0
+        self.started = time.time()
+        self.stats: Dict[str, Any] = {
+            "llm_calls": 0, "tokens_in": 0, "tokens_out": 0, "cached": 0,
+            "health_in": 0, "sent": 0, "send_secs": 0.0, "send_timeout": 0,
+            "fired": 0, "blocked": 0, "inbound": 0,
+        }
+        self.last_health: Dict[str, Any] = {}
+        self.last_health_at = 0.0        # 最后一次收到手环数据的时刻
+        self.last_llm: Dict[str, Any] = {}
+        self.health_series: List[Dict[str, Any]] = []
+        self.send_marks: List[float] = []     # 发送时刻，算"120 秒窗口"
+        self.rhythm: Dict[str, Any] = {"name": "?", "burst": 0, "window": 120.0}
+        self.model_cfg: Dict[str, Any] = {}
+
+    # ── 发事件 ────────────────────────────────────────────────────
+    def emit(self, kind: str, **data: Any) -> None:
+        try:
+            with self._lock:
+                self._seq += 1
+                ev: Dict[str, Any] = {"seq": self._seq, "t": time.time(), "kind": kind}
+                ev.update(data)
+                self._events.append(ev)
+                if len(self._events) > self.MAX_EVENTS:
+                    del self._events[:-self.MAX_EVENTS]
+                subs = list(self._subs)
+            for q in subs:
+                try:
+                    q.put_nowait(ev)
+                except Exception:
+                    pass          # 队列满 → 丢，不拖慢主循环
+        except Exception:
+            pass
+
+    # ── SSE 订阅 ──────────────────────────────────────────────────
+    def subscribe(self):
+        q: Any = queue.Queue(maxsize=self.SUB_QUEUE)
+        with self._lock:
+            if len(self._subs) >= self.MAX_SUBS:
+                return None
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: Any) -> None:
+        try:
+            with self._lock:
+                if q in self._subs:
+                    self._subs.remove(q)
+        except Exception:
+            pass
+
+    def recent(self, kind: Optional[str] = None, limit: int = 120) -> List[Dict[str, Any]]:
+        with self._lock:
+            evs = list(self._events)
+        if kind:
+            evs = [e for e in evs if e.get("kind") == kind]
+        return evs[-limit:]
+
+    # ── 健康曲线 ──────────────────────────────────────────────────
+    def add_health_point(self, metric: str, value: int, text: str, ts: float) -> None:
+        """心率/压力/血氧进曲线；其他只记最后值。"""
+        with self._lock:
+            self.last_health[metric] = {"value": value, "text": text,
+                                        "t": time.time(), "ts": ts}
+            if metric in ("hr", "stress", "spo2"):
+                self.health_series.append({"t": ts or time.time(),
+                                           "m": metric, "v": value})
+                if len(self.health_series) > self.SERIES:
+                    del self.health_series[:-self.SERIES]
+            self.last_health_at = time.time()
+
+    def feed_samples(self, text: str) -> int:
+        """把一批活动样本拆成曲线上的点。
+
+        手机端实际上只推 samples 批次（每条样本一个 JSON 对象），
+        单条 hr / stress / spo2 反而很少推 —— 不解析这个，
+        看板上的曲线永远是空的（踩过：接了半天数据，图上一条线没有）。
+        """
+        try:
+            arr = json.loads(text or "[]")
+        except Exception:
+            return 0
+        if not isinstance(arr, list):
+            return 0
+        got = 0
+        try:
+            with self._lock:
+                for s in arr[-300:]:
+                    if not isinstance(s, dict):
+                        continue
+                    t = float(s.get("t") or 0) or time.time()
+                    for key, name in (("hr", "hr"), ("st", "stress"), ("sp", "spo2")):
+                        try:
+                            v = int(s.get(key) or 0)
+                        except Exception:
+                            continue
+                        if not v:
+                            continue
+                        self.health_series.append({"t": t, "m": name, "v": v})
+                        got += 1
+                        # 最新值也更新，看板首屏才有东西显示
+                        self.last_health[name] = {"value": v, "text": "",
+                                                  "t": time.time(), "ts": t}
+                if len(self.health_series) > self.SERIES:
+                    del self.health_series[:-self.SERIES]
+                self.last_health_at = time.time()
+        except Exception:
+            pass
+        return got
+
+    # ── 限速窗口 ──────────────────────────────────────────────────
+    def mark_send(self, secs: float = 0.0) -> None:
+        now = time.time()
+        with self._lock:
+            self.send_marks.append(now)
+            # 只留最近 10 分钟
+            self.send_marks = [t for t in self.send_marks if now - t < 600]
+            self.stats["sent"] += 1
+            self.stats["send_secs"] += float(secs or 0)
+
+    def send_window_usage(self) -> Dict[str, Any]:
+        """当前"窗口内已经写了几条"。"""
+        win = float(self.rhythm.get("window") or 120.0)
+        now = time.time()
+        with self._lock:
+            marks = [t for t in self.send_marks if now - t < win]
+        burst = int(self.rhythm.get("burst") or 0)
+        oldest = min(marks) if marks else None
+        return {
+            "window": win,
+            "burst": burst,
+            "used": len(marks),
+            "remain": max(0, burst - len(marks)) if burst else None,
+            "resetIn": (win - (now - oldest)) if oldest else 0.0,
+        }
+
+    # ── 首屏快照 ──────────────────────────────────────────────────
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            stats = dict(self.stats)
+            health = dict(self.last_health)
+            series = list(self.health_series)
+            llm = dict(self.last_llm)
+            evs = list(self._events)[-160:]
+        return {
+            "now": time.time(),
+            "started": self.started,
+            "uptime": time.time() - self.started,
+            "stats": stats,
+            "health": health,
+            "healthAt": self.last_health_at,       # 看板用它判断"手环数据中断"
+            "series": series,
+            "llm": llm,
+            "model": dict(self.model_cfg),
+            "rhythm": self.send_window_usage(),
+            "events": evs,
+            "seq": self._seq,
+        }
+
+
+TELEM = Telemetry()
+
+
 def log(*a: Any) -> None:
     line = time.strftime("[%Y-%m-%d %H:%M:%S] ") + " ".join(str(x) for x in a)
     with _logLock:
@@ -296,6 +479,11 @@ def log(*a: Any) -> None:
                 f.write(line + "\n")
         except Exception:
             pass
+    # 顺手喂给控制台（她写的每一行日志，看板上都能实时看到）
+    try:
+        TELEM.emit("log", line=line.split("] ", 1)[-1])
+    except Exception:
+        pass
 
 
 def read_credential(path: str, ref: str) -> str:
@@ -509,6 +697,19 @@ class HealthServer:
                 if metric == "hr" and not (20 <= value <= 250):
                     self._json(200, {"ok": True, "ignored": True})
                     return
+                # ── 喂给控制台 ────────────────────────────────────────
+                try:
+                    text = str(data.get("text") or "")
+                    ts = float(data.get("ts") or 0) or time.time()
+                    TELEM.stats["health_in"] += 1
+                    TELEM.add_health_point(metric, value, text, ts)
+                    # 手机主要推 samples 批次，单条指标很少 —— 批次要拆开喂曲线
+                    if metric == "samples" and text:
+                        TELEM.feed_samples(text)
+                    TELEM.emit("health", metric=metric, value=value, text=text,
+                               ts=ts, src=self.client_address[0])
+                except Exception:
+                    pass
                 outer.bot._on_health(metric, value, str(data.get("text") or ""))
                 self._json(200, {"ok": True})
 
@@ -523,14 +724,81 @@ class HealthServer:
 
             def do_GET(self):
                 from urllib.parse import urlparse, parse_qs
-                if outer.bot.health_debug:
+                path = urlparse(self.path).path
+                # 看板自己会每秒轮询 /api/state，别把它写进日志 ——
+                # 不然她的一切真实活动都会被自己的监控刷掉（踩过）。
+                _quiet = path in ("/api/state", "/console", "/console/", "/index.html",
+                                   "/favicon.ico", "/events")
+                if outer.bot.health_debug and not _quiet:
                     log(f"  收到 HTTP GET  来自 {self.client_address[0]}  {self.path[:60]}")
+
+                # ── 控制台 ────────────────────────────────────────────
+                if path in ("/console", "/console/", "/", "/index.html"):
+                    return self._serve_console()
+                if path == "/api/state":
+                    return self._json(200, TELEM.snapshot())
+                if path == "/events":
+                    return self._serve_sse()
+
                 q = parse_qs(urlparse(self.path).query)
                 if "v" in q:
                     self._handle(("{\"metric\":\"hr\",\"value\":%s}"
                                   % q["v"][0]).encode("utf-8"))
                 else:
-                    self._json(200, {"ok": True, "hint": "POST JSON to /hr"})
+                    self._json(200, {"ok": True, "hint": "POST JSON to /hr",
+                                     "console": "/console"})
+
+            # ── 控制台：单页 ──────────────────────────────────────────
+            def _serve_console(self) -> None:
+                import os as _os
+                fp = _os.path.join(HERE, "console.html")
+                try:
+                    with open(fp, "rb") as f:
+                        body = f.read()
+                except Exception as e:
+                    self._json(500, {"ok": False, "error": "console.html 读不到: %s" % e})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            # ── 控制台：SSE ──────────────────────────────────────────
+            def _serve_sse(self) -> None:
+                q = TELEM.subscribe()
+                if q is None:
+                    self._json(503, {"ok": False, "error": "连接数已满"})
+                    return
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    import json as _j
+                    self.wfile.write(("event: hello\ndata: %s\n\n"
+                                      % _j.dumps(TELEM.snapshot(), ensure_ascii=False)).encode("utf-8"))
+                    self.wfile.flush()
+                    last_ping = time.time()
+                    while True:
+                        try:
+                            ev = q.get(timeout=2.0)
+                            payload = _j.dumps(ev, ensure_ascii=False)
+                            self.wfile.write(("data: %s\n\n" % payload).encode("utf-8"))
+                            self.wfile.flush()
+                        except Exception:
+                            pass          # 超时 → 发心跳，顺便探测连接是否还活着
+                        if time.time() - last_ping >= 10:
+                            last_ping = time.time()
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                except Exception:
+                    pass
+                finally:
+                    TELEM.unsubscribe(q)
 
         try:
             self.httpd = http.server.ThreadingHTTPServer(("0.0.0.0", self.port), H)
@@ -542,6 +810,7 @@ class HealthServer:
         self.thread.start()
         log(f"  健康数据接收已开: http://0.0.0.0:{self.port}/hr"
             + ("  （需要 X-Token）" if self.token else ""))
+        log(f"  监控看板: http://127.0.0.1:{self.port}/console")
         return True
 
 
@@ -789,21 +1058,55 @@ class LLM:
             },
             method="POST",
         )
+        _t0 = time.time()
+        # 看板：把"她准备说什么"的完整输入也发出去（含 system，这是人设）
         try:
-            with urllib.request.urlopen(req, timeout=90) as r:
-                j = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", "replace")[:300]
-            except Exception:
-                pass
-            log(f"  API HTTP {e.code}: {detail}")
-            return ""
+            TELEM.emit("llm_request",
+                       model=body.get("model"),
+                       thinking=body.get("thinking"),
+                       effort=body.get("reasoning_effort"),
+                       max_tokens=body.get("max_tokens"),
+                       system=system,
+                       history=len(h),
+                       user=user)
+        except Exception:
+            pass
+        # ── 发请求：先流式，挂了回退非流式 ──────────────────────────────
+        # 流式能把**思考过程一帧一帧推给看板**（实测 reasoning 首帧 +0.6s 就到）。
+        # 但它属于动核心链路，所以流式一旦出问题必须**无缝退回**下面这条老路径 ——
+        # 回复本身绝不能因为看板好看不好看而丢掉。
+        j = None
+        try:
+            j = self._request_stream(body, _t0)
         except Exception as e:
-            log(f"  API 出错: {e}")
-            return ""
+            log(f"  流式请求不可用（{e.__class__.__name__}: {e}），回退非流式")
 
+        if j is None:
+            try:
+                with urllib.request.urlopen(req, timeout=90) as r:
+                    j = json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    pass
+                log(f"  API HTTP {e.code}: {detail}")
+                try:
+                    TELEM.emit("llm_error", code=e.code, detail=detail,
+                               ms=int((time.time() - _t0) * 1000))
+                except Exception:
+                    pass
+                return ""
+            except Exception as e:
+                log(f"  API 出错: {e}")
+                try:
+                    TELEM.emit("llm_error", detail=str(e), ms=int((time.time() - _t0) * 1000))
+                except Exception:
+                    pass
+                return ""
+
+        _ms = int((time.time() - _t0) * 1000)
         try:
             u = j.get("usage") or {}
             self.calls += 1
@@ -812,6 +1115,10 @@ class LLM:
             self.tokens_in += self.last_in
             self.tokens_out += self.last_out
             self.last_cached = int(((u.get("prompt_tokens_details") or {}).get("cached_tokens")) or 0)
+            TELEM.stats["llm_calls"] = self.calls
+            TELEM.stats["tokens_in"] = self.tokens_in
+            TELEM.stats["tokens_out"] = self.tokens_out
+            TELEM.stats["cached"] += self.last_cached
         except Exception:
             pass
 
@@ -821,7 +1128,107 @@ class LLM:
             log(f"  返回结构异常: {str(j)[:200]}")
             return ""
         text = (msg.get("content") or "").strip()
+        # 思考过程 —— 字段名各家不一，能抓的都抓
+        think = (msg.get("reasoning_content") or msg.get("reasoning")
+                 or msg.get("thinking") or "")
+        if isinstance(think, dict):
+            think = think.get("content") or think.get("text") or ""
+        think = str(think or "").strip()
+        try:
+            TELEM.last_llm = {
+                "ms": _ms, "in": self.last_in, "out": self.last_out,
+                "cached": self.last_cached, "thinking": bool(think),
+                "call": self.calls, "t": time.time(),
+                "model": body.get("model"), "effort": body.get("reasoning_effort"),
+            }
+            TELEM.emit("llm_reply", text=text, thinking=think,
+                       ms=_ms, in_tok=self.last_in, out_tok=self.last_out,
+                       cached=self.last_cached, call=self.calls,
+                       finish=(j["choices"][0].get("finish_reason") if j.get("choices") else None))
+        except Exception:
+            pass
         return text
+
+    def _request_stream(self, body: Dict[str, Any], t0: float) -> Optional[Dict[str, Any]]:
+        """流式请求：边收边把思考推给看板，最后拼成**和非流式响应同构**的 dict。
+
+        为什么要同构：下游解析（usage / choices[0].message / reasoning_content）
+        一行都不用动，出错时也能无缝退回旧的 urlopen 路径。
+
+        看板那边靠 llm_thinking 事件实时刷新思考面板；
+        限流到 0.35s 一帧，免得把 SSE 和 800 条的事件环刷爆。
+        """
+        b = dict(body)
+        b["stream"] = True
+        b["stream_options"] = {"include_usage": True}
+        req = urllib.request.Request(
+            self.url,
+            data=json.dumps(b, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        text_parts: List[str] = []
+        think_parts: List[str] = []
+        usage: Dict[str, Any] = {}
+        finish: Optional[str] = None
+        frames = 0
+        last_push = 0.0
+        with urllib.request.urlopen(req, timeout=90) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue          # 空行 / 注释 / 心跳
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    frame = json.loads(payload)
+                except Exception:
+                    continue
+                frames += 1
+                if frame.get("usage"):
+                    usage = frame["usage"]
+                choices = frame.get("choices") or []
+                if not choices:
+                    continue
+                if choices[0].get("finish_reason"):
+                    finish = choices[0]["finish_reason"]
+                delta = choices[0].get("delta") or {}
+                rc = delta.get("reasoning_content") or delta.get("reasoning")
+                if rc:
+                    think_parts.append(str(rc))
+                    now = time.time()
+                    if now - last_push >= 0.35:
+                        last_push = now
+                        try:
+                            TELEM.emit("llm_thinking", text="".join(think_parts),
+                                       partial=True, ms=int((now - t0) * 1000))
+                        except Exception:
+                            pass
+                c = delta.get("content")
+                if c:
+                    text_parts.append(str(c))
+
+        if frames == 0:
+            # 一帧都没收到 → 当成失败，让上层回退非流式（而不是发一条空消息）
+            raise RuntimeError("流式没收到任何帧")
+
+        think = "".join(think_parts)
+        text = "".join(text_parts)
+        if think:
+            try:
+                TELEM.emit("llm_thinking", text=think, partial=False,
+                           ms=int((time.time() - t0) * 1000))
+            except Exception:
+                pass
+        return {
+            "choices": [{"message": {"content": text, "reasoning_content": think},
+                         "finish_reason": finish}],
+            "usage": usage,
+        }
 
 
 # ────────────────────────────────── 主逻辑 ──────────────────────────────────
@@ -1322,11 +1729,21 @@ class Bot:
         ask = hist[-1]["content"] + "\n\n" + _now_note()
         reply = self.llm.chat(sysm, hist[:-1], ask, images=imgs)
         if not reply:
-            log(f"    模型没给出内容，跳过")
+            # ⚠️ 实测 2026-10-06 19:33：思考开着的时候，reasoning token **也占 max_tokens**。
+            #    他问「我能不能陪你一辈子」，她想了 400 token 就把额度用完，
+            #    finish_reason=length，正文 0 字节 —— 然后旧代码直接 return。
+            #    对用户来说就是"她突然不理我了"，而且**没有任何提示**。
+            #    空响应是偶发的，原样重试一次基本都能出。
+            log("    模型没给出内容（可能是思考吃满了 max_tokens），重试一次")
+            reply = self.llm.chat(sysm, hist[:-1], ask, images=imgs)
+        if not reply:
+            log("    模型两次都没给出内容，跳过这一轮")
             return
 
         reply = self._clean(reply)
         if not reply:
+            # 清洗后变空（比如整条都是时间戳/括号独白）—— 至少留个痕，别静默
+            log("    清洗后为空，跳过这一轮")
             return
 
         self.ctx.add(chat, "assistant", f"{_hhmm()} {reply}")
@@ -1342,9 +1759,13 @@ class Bot:
     def _clean(self, t: str) -> str:
         t = re.sub(r"^\[QQ\]|\[/QQ\]$", "", t.strip()).strip()
         # 偶尔会学聊天记录的格式给整段加个「芙：」前缀 —— 那是记录，不是消息内容
-        # ⚠️ 上下文里每条消息前面带 [HH:MM]，她会学着自己也输出一个 ——
+        # ⚠️ 上下文里每条消息前面带 [10-06 11:21]，她会学着自己也输出一个 ——
         # 实测漏过「[01:53] ……我也没睡」，发出去很怪。行首的时间戳全部剥掉。
-        t = re.sub(r"^\s*\[(?:\d{4}-)?\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}\]\s*", "", t, flags=re.M)
+        t = re.sub(r"^\s*[\[【](?:\d{4}-)?\d{1,2}-\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?[\]】]\s*", "", t, flags=re.M)
+        # 🚨 她会**只抄时间、把日期丢掉** —— 2026-10-06 11:22 又漏过一次：
+        #    「[11:21] 你回得倒快」。上面那条要求「月-日 时:分」齐活，匹配不到，
+        #    所以这里再兜一条纯 [HH:MM]（行首，带不带日期都不会误伤正文）。
+        t = re.sub(r"^\s*[\[【]\d{1,2}:\d{2}(?::\d{2})?[\]】]\s*", "", t, flags=re.M)
         t = re.sub(r"^\s*[\u4e00-\u9fa5A-Za-z]{1,4}[：:]\s*", "", t)
         t = re.sub(r"^\s*(?:作为|身为)[^，。]{0,12}(?:AI|人工智能|语言模型)[，,]\s*", "", t)
         t = t.replace("**", "").replace("`", "")
@@ -1407,10 +1828,15 @@ class Bot:
         # 先按逗号/顿号切，还是太长就硬切。
         limit = int(CFG.get("maxBubbleChars") or 26)
         if limit > 0:
-            split2: List[str] = []
+            # ⚠️ 每个碎片都要记住"它是不是我硬切出来的"。
+            #    模型自己一行的短句（「你吃饭了没」5 个字）本身是完整的一句，
+            #    **不能再焊到上一条上去** —— 实测 2026-10-06 21:50：模型给了 3 行，
+            #    第三行 5 个字被并进第二行，结果是 3 段变 2 段，而且焊出来是
+            #    「行了我喊了，别得寸进尺你吃饭了没」这种病句，中间连标点都没有。
+            split2 = []          # [(文本, 是不是硬切出来的碎片)]
             for s in out:
                 if len(s) <= limit:
-                    split2.append(s)
+                    split2.append((s, False))            # 模型原样的一行
                     continue
                 parts = [x for x in re.split(r"(?<=[，,、；;：])", s) if x.strip()]
                 # 悬空逗号只摘**气泡末尾**那一个 —— 拼在中间的逗号要留着，
@@ -1421,19 +1847,21 @@ class Bot:
                         buf += p
                     else:
                         if buf.strip():
-                            split2.append(re.sub(r"[，,、；;：]\s*$", "", buf.strip()))
+                            split2.append((re.sub(r"[，,、；;：]\s*$", "", buf.strip()), True))
                         buf = p
                         while len(buf) > limit:      # 单段本身超长 → 硬切
-                            split2.append(buf[:limit])
+                            split2.append((buf[:limit], True))
                             buf = buf[limit:]
                 if buf.strip():
-                    split2.append(re.sub(r"[，,、；;：]\s*$", "", buf.strip()))
-            # 收尾：把过短的碎片并回上一条
+                    split2.append((re.sub(r"[，,、；;：]\s*$", "", buf.strip()), True))
+            # 收尾：把过短的**硬切碎片**并回上一条
             # （硬切会切出「普通人。」这种 4 字孤儿泡，很怪）
+            # 模型自己那行不管多短都单独发 —— 微信里「你吃饭了没」自己一条很正常。
             minlen = int(CFG.get("minBubbleChars") or 6)
             merged: List[str] = []
-            for s in split2:
-                if merged and len(s) < minlen and len(merged[-1]) + len(s) <= limit + 4:
+            for s, frag in split2:
+                if (frag and merged and len(s) < minlen
+                        and len(merged[-1]) + len(s) <= limit + 4):
                     merged[-1] = merged[-1] + s
                 else:
                     merged.append(s)
@@ -1453,6 +1881,19 @@ class Bot:
                 log(f"  气泡 {len(out)} 条（软上限 {cap}）—— 都是短句，照发")
         return out
 
+    def _is_group(self, chat: str = "") -> bool:
+        """这是不是群聊。
+
+        判断依据（任一命中即算）：
+          ① 配置里显式写了 kind: "group"
+          ② 会话名字本身是 @chatroom 号
+          ③ 兜底：mode 是 wake 的一律当群（私聊配 always，群聊配 wake）
+        """
+        conf = (self.chat_by_name.get(chat) or {}) if chat else {}
+        return (str(conf.get("kind") or "").lower() == "group"
+                or "@chatroom" in str(chat)
+                or str(conf.get("mode") or "").lower() == "wake")
+
     def _bubble_cap(self, chat: str = "") -> int:
         """这条回复最多几个气泡。
 
@@ -1461,16 +1902,10 @@ class Bot:
         另外发送慢的时候自适应降条数：慢（≤20s）砍到 3；很慢（>20s）砍到 2。
         """
         base = max(1, int(CFG.get("maxBubbles") or 3))
-        # 判断这是不是群聊：
-        #   ① 配置里显式写了 kind: "group"
-        #   ② 会话名字本身是 @chatroom 号
-        #   ③ 兜底：mode 是 wake 的一律当群（私聊配 always，群聊配 wake）
-        conf = (self.chat_by_name.get(chat) or {}) if chat else {}
-        is_group = (str(conf.get("kind") or "").lower() == "group"
-                    or "@chatroom" in str(chat)
-                    or str(conf.get("mode") or "").lower() == "wake")
-        if is_group:
+        if self._is_group(chat):
             base = min(base, max(1, int(CFG.get("groupMaxBubbles") or 2)))
+        # 发送慢的时候降条数 —— **只对群聊有意义**了。
+        # 私聊已经不压气泡了（见 _deliver），这个值在私聊里只剩日志用途。
         recent = _recent_send_secs[-5:]
         if not recent:
             return base
@@ -2128,8 +2563,16 @@ class Bot:
         hc = CFG.get("health") or {}
         now = time.time()
         st = self._health_state
-        if now - float(st.get("last_fire") or 0) < int(hc.get("cooldownMin") or 25) * 60:
+        cool = int(hc.get("cooldownMin") or 25) * 60
+
+        def _skip(why: str) -> None:
+            TELEM.stats["blocked"] += 1
+            TELEM.emit("trigger", trig=kind, value=value, fired=False, why=why)
+
+        if now - float(st.get("last_fire") or 0) < cool:
             log(f"  {kind}：还在冷却里，跳过")
+            _skip("冷却中（还剩 %d 分钟）"
+                  % max(0, round((cool - (now - float(st.get('last_fire') or 0))) / 60)))
             return
         today = time.strftime("%Y-%m-%d")
         if st.get("day") != today:
@@ -2137,6 +2580,7 @@ class Bot:
             st["count"] = 0
         if int(st.get("count") or 0) >= int(hc.get("dailyLimit") or 10):
             log(f"  {kind}：今天已经说够了，跳过")
+            _skip("今日名额用完（%s/%s）" % (st.get("count"), hc.get("dailyLimit") or 10))
             return
         qh = hc.get("quietHours") or []
         if len(qh) == 2:
@@ -2144,6 +2588,7 @@ class Bot:
             qlo, qhi = int(qh[0]), int(qh[1])
             if (qlo <= hh < qhi) if qlo <= qhi else (hh >= qlo or hh < qhi):
                 log(f"  {kind}：静默时段，跳过")
+                _skip("静默时段 %d-%d 点" % (qlo, qhi))
                 return
         # 互斥：运动时心率高、睡觉时压力低，这些都不该说话
         # 睡着时的高心率换一套说法（"在干嘛呀"对睡着的人是错的）
@@ -2153,9 +2598,11 @@ class Bot:
         blocked = self._health_blocked(kind)
         if blocked:
             log(f"  {kind}：{blocked}，跳过")
+            _skip("互斥：%s" % blocked)
             return
         reason = self._HEALTH_PROMPTS.get(kind)
         if not reason:
+            _skip("没有对应剧本")
             return
         if extra:
             reason = (reason.replace("{sport}", extra)
@@ -2166,6 +2613,9 @@ class Bot:
         st["last_fire"] = now
         st["count"] = int(st.get("count") or 0) + 1
         log(f"  {kind} → 让她说一句（今天第 {st['count']} 次）")
+        TELEM.stats["fired"] += 1
+        TELEM.emit("trigger", trig=kind, value=value, fired=True, reason=reason,
+                   count=st["count"], limit=int(hc.get("dailyLimit") or 10))
         threading.Thread(target=self._health_say, args=(reason,),
                          daemon=True, name="health").start()
 
@@ -2218,9 +2668,15 @@ class Bot:
             return
         cap = self._bubble_cap(chat)
         if len(bubbles) > cap:
-            # 超出的并进最后一条（保留换行，读起来还是分句的）
-            log(f"  发送偏慢，气泡从 {len(bubbles)} 压到 {cap}")
-            bubbles = bubbles[:cap - 1] + ["\n".join(bubbles[cap - 1:])]
+            if self._is_group(chat):
+                # 群里刷一长串气泡很像机器人 —— 压成一条（保留换行）
+                log(f"  群聊发送偏慢，气泡从 {len(bubbles)} 压到 {cap}")
+                bubbles = bubbles[:cap - 1] + ["\n".join(bubbles[cap - 1:])]
+            else:
+                # ⚠️ 私聊**不压** —— 宁可多发两条短气泡，也不把尾巴焊成一条。
+                #    实测焊出来是「行了我喊了，别得寸进尺你吃饭了没」这种病句，
+                #    而且 3 段变 2 段。真人打一段长想法本来就是连着发几条短的。
+                log(f"  气泡 {len(bubbles)} 条（发送偏慢的软上限是 {cap}）—— 私聊照发，不压")
         if time.time() < _send_paused_until[0]:
             left = int(_send_paused_until[0] - time.time())
             log(f"  ⏸ 发送通道冷却中（还剩 {left}s），这一轮放弃：{bubbles[0][:40]}")
@@ -2246,14 +2702,19 @@ class Bot:
                 res, secs, how = _quick_send_safe(b, chat, i == 0, soft, hard)
             if how == "TIMEOUT":
                 _send_stats["timeout"] += 1
+                TELEM.stats["send_timeout"] += 1
                 # 真卡住了：停 5 分钟，别让 UI 自动化越堆越多
                 _send_paused_until[0] = time.time() + float(CFG.get("sendPauseSeconds") or 300)
                 log(f"    ⚠️ [{i+1}/{len(bubbles)}] 发送卡死（{secs:.0f}s），"
                     f"暂停发送 {int(CFG.get('sendPauseSeconds') or 300)}s 后重试：{b}")
+                TELEM.emit("send", chat=chat, text=b, secs=secs, ok=False,
+                           how="TIMEOUT", part="%d/%d" % (i + 1, len(bubbles)))
                 break
             if how.startswith("ERR"):
                 _send_stats["error"] += 1
                 log(f"    ✗ [{i+1}/{len(bubbles)}] 发送失败：{how}")
+                TELEM.emit("send", chat=chat, text=b, secs=secs, ok=False,
+                           how=how, part="%d/%d" % (i + 1, len(bubbles)))
                 continue
             _send_stats["ok"] += 1
             _recent_send_secs.append(secs)
@@ -2268,6 +2729,10 @@ class Bot:
                 tail = "  ⚠慢"
             log(f"    [{i+1}/{len(bubbles)}] {b}   -> {getattr(res, 'message', res)}"
                 f"  ({secs:.1f}s){tail}")
+            TELEM.mark_send(secs)
+            TELEM.emit("send", chat=chat, text=b, secs=secs, ok=True, how=how,
+                       part="%d/%d" % (i + 1, len(bubbles)),
+                       window=TELEM.send_window_usage())
         log(f"    本轮 token: in={self.llm.last_in} out={self.llm.last_out} "
             f"（发送 成功={_send_stats['ok']} 超时={_send_stats['timeout']} "
             f"失败={_send_stats['error']}）")
@@ -2391,6 +2856,20 @@ class Bot:
         except Exception:
             return None
 
+    @staticmethod
+    def _rand_min_in_window(lo: int, hi: int) -> int:
+        """在 [lo, hi] 分钟里随机取一个；**窗口跨零点**时从两段里取。
+
+        ⚠️ 实测 2026-10-07 00:15：失眠窗口默认是 23:30 → 00:45，
+        也就是 lo=1410、hi=45 —— 直接 random.randint(1410, 45) 会抛
+        `ValueError: empty range in randrange(1410, 46)`，而且这个错误
+        **只在 23:30~00:45 之间发作**，等于把失眠那一档整晚废掉。
+        跨零点时要取 [lo,1440) ∪ [0,hi]。
+        """
+        if hi < lo:
+            return (lo + random.randrange((1440 - lo) + (hi + 1))) % 1440
+        return random.randint(lo, hi)
+
     def _insomnia_today(self, sc: Dict[str, Any], st: Dict[str, Any]) -> bool:
         """今天是不是失眠日。
 
@@ -2479,7 +2958,7 @@ class Bot:
                 k = f"{today}:失眠"
                 j = jit_map.get(k)
                 if j is None:
-                    j = random.randint(lo, hi)
+                    j = self._rand_min_in_window(lo, hi)
                     jit_map[k] = j
                 # 过了 21 点或者凌晨之后才算到点（允许跨零点）
                 if (now_min >= j and now_min < 5 * 60) or (now_min >= 21 * 60 and j >= now_min):
@@ -2781,6 +3260,29 @@ def main() -> None:
 
     os.makedirs(os.path.dirname(CFG["logFile"]), exist_ok=True)
 
+    # ── 代理 ─────────────────────────────────────────────────────────
+    # ⚠️ 血泪教训：这个进程如果是从一个设了 HTTPS_PROXY 的 shell 里启动的，
+    # 会把那个代理**继承**下来。等代理软件一关，所有 API 请求就变成
+    # "WinError 10061 由于目标计算机积极拒绝" —— 而且看起来像是 DeepSeek 挂了，
+    # 你会去查 API、查 key、查余额，就是想不到是自己 shell 的环境变量。
+    #
+    # DeepSeek 的 API 在国内直连就行，不需要代理。
+    # 所以：配置里显式写了 proxy 才用，否则一律清干净。
+    _proxy = str(CFG.get("proxy") or "").strip()
+    if _proxy:
+        os.environ["HTTP_PROXY"] = _proxy
+        os.environ["HTTPS_PROXY"] = _proxy
+        log(f"  API 走代理: {_proxy}")
+    else:
+        _had = [k for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+                            "http_proxy", "https_proxy", "all_proxy")
+                if os.environ.pop(k, None)]
+        os.environ["NO_PROXY"] = "*"
+        os.environ["no_proxy"] = "*"
+        # 永远打这行 —— 排查"API 连不上"时，第一眼就该看到它
+        log("  API 直连（不走代理）"
+            + ("，已清掉继承来的 " + "/".join(_had) if _had else ""))
+
     # 设置 wechatauto 的节奏档位（防封号限速）
     try:
         import wechatauto.rhythm as _rhythm
@@ -2796,8 +3298,26 @@ def main() -> None:
         elif prof:
             p = _rhythm.set_profile(prof)
             print(f"wechatauto 节奏：{p.name} burst={p.burst} window={p.window}")
+        # 给控制台看板用：现在是哪个档位、窗口多长、里面能写几条
+        TELEM.rhythm = {"name": getattr(p, "name", prof),
+                        "burst": int(getattr(p, "burst", 0) or 0),
+                        "window": float(getattr(p, "window", 120.0) or 120.0)}
     except Exception as e:
         print(f"设置 wechatauto 节奏失败（忽略）：{e}", file=sys.stderr)
+
+    # 看板要展示"发给模型的是什么"
+    try:
+        TELEM.model_cfg = {
+            "model": CFG.get("model"),
+            "baseUrl": CFG.get("baseUrl"),
+            "thinking": CFG.get("thinking"),
+            "maxTokens": CFG.get("maxTokens"),
+            "historyLimit": CFG.get("historyLimit"),
+            "temperature": CFG.get("temperature"),
+            "contextFile": os.path.basename(str(CFG.get("contextFile") or "")),
+        }
+    except Exception:
+        pass
 
     log("=" * 60)
     log(f"启动 大肥鱼（独立版）key={key[:6]}...{key[-4:]}")

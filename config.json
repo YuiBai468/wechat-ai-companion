@@ -48,8 +48,8 @@
   "logFile": "logs/wechat-bot.log",
   "thinking": "low",
   "temperature": 1.15,
-  "maxTokens": 400,
-  "maxBubbles": 5,
+  "maxTokens": 900,
+  "maxBubbles": 6,
   "bubbleGapMin": 0.5,
   "bubbleGapMax": 2,
   "proactive": {
